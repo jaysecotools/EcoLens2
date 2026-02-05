@@ -7,7 +7,6 @@
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.28/jspdf.plugin.autotable.min.js"></script>
     <style>
         /* CSS Reset & Base Styles */
         * {
@@ -495,6 +494,34 @@
             font-size: 0.9rem;
         }
 
+        .validation-stats {
+            display: flex;
+            gap: 1rem;
+            margin: 1rem 0;
+            flex-wrap: wrap;
+        }
+
+        .stat-item {
+            padding: 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        .stat-valid {
+            background: #d5edda;
+            color: #155724;
+        }
+
+        .stat-invalid {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .stat-warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
         /* Status Messages */
         .status-message {
             padding: 1rem;
@@ -613,6 +640,28 @@
             align-items: center;
             gap: 0.5rem;
             padding: 0.25rem 0;
+        }
+
+        /* Mini Map Preview */
+        .mini-map-preview {
+            height: 150px;
+            width: 100%;
+            border-radius: 4px;
+            margin: 0.5rem 0;
+            border: 1px solid #e0e0e0;
+        }
+
+        .coordinate-validation {
+            font-size: 0.85rem;
+            margin-top: 0.25rem;
+        }
+
+        .coordinate-valid {
+            color: #27ae60;
+        }
+
+        .coordinate-invalid {
+            color: #e74c3c;
         }
 
         /* Mobile Optimizations */
@@ -938,17 +987,28 @@
                         </div>
                     </div>
                     <div class="import-note">
-                        <strong>Note:</strong> Import CSV files exported from EcoLens. Required headers: 
-                        ID, Timestamp, Observer Name, Scientific Name, Common Name, Location, Latitude, Longitude, 
-                        Habitat, Observation Type, Characteristics, Equipment, References, Notes, Has Photo.<br>
-                        <strong>Date format:</strong> Use ISO format (YYYY-MM-DDTHH:mm:ss) or standard locale format like MM/DD/YYYY or DD/MM/YYYY.
+                        <strong>Required format:</strong> CSV with headers: ID, Timestamp, Observer Name, Scientific Name, Common Name, Location, Latitude, Longitude, Habitat, Observation Type, Characteristics, Equipment, References, Notes, Has Photo.<br>
+                        <strong>Date format:</strong> Use ISO format (YYYY-MM-DDTHH:mm:ss) for best results. Example: 2023-12-25T14:30:00<br>
+                        <strong>⚠️ Safety note:</strong> Text starting with =, +, -, @ will be prefixed with ' to prevent formula execution in spreadsheet software.
                     </div>
                 </div>
                 
                 <!-- CSV Preview & Validation Section -->
                 <div id="csv-preview-section" class="csv-preview-section">
                     <h3>CSV Preview & Validation</h3>
+                    
+                    <!-- Validation Statistics -->
+                    <div id="validation-stats" class="validation-stats" style="display: none;">
+                        <div id="stat-valid-rows" class="stat-item stat-valid"></div>
+                        <div id="stat-invalid-rows" class="stat-item stat-invalid"></div>
+                        <div id="stat-warning-rows" class="stat-item stat-warning"></div>
+                    </div>
+                    
                     <div id="validation-summary" class="validation-summary"></div>
+                    
+                    <!-- Mini Map Preview for Coordinates -->
+                    <div id="mini-map-container" class="mini-map-preview" style="display: none;"></div>
+                    
                     <div id="preview-table-container" style="overflow: auto; max-height: 300px;">
                         <table id="csv-preview-table" class="csv-preview-table"></table>
                     </div>
@@ -982,7 +1042,7 @@
                     <label class="form-label">Export Format</label>
                     <div class="export-option">
                         <input type="radio" id="export-pdf" name="export-format" value="pdf" checked aria-label="Export as PDF">
-                        <label for="export-pdf">PDF Field Log</label>
+                        <label for="export-pdf">PDF Field Log (with photos)</label>
                     </div>
                     <div class="export-option">
                         <input type="radio" id="export-csv" name="export-format" value="csv" aria-label="Export as CSV">
@@ -1067,6 +1127,7 @@
         isGeneratingPDF: false,
         csvPreviewData: null,
         selectedObservations: new Set(), // For batch export
+        miniMap: null, // For coordinate preview
 
         // Initialize the application
         init() {
@@ -1186,6 +1247,22 @@
             }
         },
 
+        // Sanitize CSV value to prevent formula injection
+        sanitizeCSVValue(value) {
+            if (!value || typeof value !== 'string') return value || '';
+            
+            // Check if value starts with formula characters
+            const formulaChars = ['=', '+', '-', '@'];
+            const firstChar = value.charAt(0);
+            
+            if (formulaChars.includes(firstChar)) {
+                // Prefix with apostrophe to prevent formula execution in Excel/Sheets
+                return "'" + value;
+            }
+            
+            return value;
+        },
+
         // Validate and parse CSV data with detailed error reporting
         validateAndParseCSV(csvContent) {
             const result = {
@@ -1194,8 +1271,12 @@
                 errors: [],
                 warnings: [],
                 validRows: 0,
+                invalidRows: 0,
+                warningRows: 0,
                 totalRows: 0,
-                summary: ''
+                summary: '',
+                hasCoordinates: false,
+                coordinates: []
             };
 
             try {
@@ -1220,6 +1301,9 @@
                     result.warnings.push(`Extra headers found: ${extraHeaders.join(', ')}`);
                 }
 
+                // Check if CSV has coordinate columns
+                result.hasCoordinates = result.headers.includes('Latitude') && result.headers.includes('Longitude');
+
                 // Parse data rows with validation
                 for (let i = 1; i < lines.length; i++) {
                     const line = lines[i].trim();
@@ -1237,6 +1321,13 @@
                             rowData[header] = row[index] || '';
                         });
 
+                        // Sanitize all values to prevent CSV injection
+                        Object.keys(rowData).forEach(key => {
+                            if (typeof rowData[key] === 'string') {
+                                rowData[key] = this.sanitizeCSVValue(rowData[key]);
+                            }
+                        });
+
                         // Validate required fields
                         REQUIRED_CSV_HEADERS.forEach(header => {
                             if (result.headers.includes(header)) {
@@ -1247,29 +1338,40 @@
                             }
                         });
 
-                        // Validate date format
+                        // Validate date format with clear guidance
                         if (result.headers.includes('Timestamp') && rowData['Timestamp']) {
                             const date = this.parseCSVTimestamp(rowData['Timestamp']);
                             if (!date || isNaN(date.getTime())) {
-                                rowWarnings.push(`Row ${i}: Invalid date format for Timestamp. Use ISO format (YYYY-MM-DDTHH:mm:ss) or standard locale format.`);
+                                rowWarnings.push(`Row ${i}: Invalid date format. Use ISO format (YYYY-MM-DDTHH:mm:ss) like "2023-12-25T14:30:00"`);
                             } else {
                                 rowData['_parsedTimestamp'] = date;
+                                // Check if date format might be ambiguous
+                                const dateStr = rowData['Timestamp'];
+                                if (dateStr.includes('/')) {
+                                    rowWarnings.push(`Row ${i}: Using date with slashes (/) - ensure format is MM/DD/YYYY or DD/MM/YYYY consistently`);
+                                }
                             }
                         }
 
-                        // Validate numeric fields
-                        if (result.headers.includes('Latitude') && rowData['Latitude']) {
+                        // Validate and parse coordinates if present
+                        let hasValidCoords = false;
+                        if (result.hasCoordinates && rowData['Latitude'] && rowData['Longitude']) {
                             const lat = parseFloat(rowData['Latitude']);
-                            if (isNaN(lat) || lat < -90 || lat > 90) {
-                                rowWarnings.push(`Row ${i}: Invalid Latitude value`);
-                            }
-                        }
-
-                        if (result.headers.includes('Longitude') && rowData['Longitude']) {
                             const lng = parseFloat(rowData['Longitude']);
-                            if (isNaN(lng) || lng < -180 || lng > 180) {
-                                rowWarnings.push(`Row ${i}: Invalid Longitude value`);
+                            
+                            if (isNaN(lat) || lat < -90 || lat > 90) {
+                                rowWarnings.push(`Row ${i}: Invalid Latitude value "${rowData['Latitude']}". Must be between -90 and 90.`);
+                            } else if (isNaN(lng) || lng < -180 || lng > 180) {
+                                rowWarnings.push(`Row ${i}: Invalid Longitude value "${rowData['Longitude']}". Must be between -180 and 180.`);
+                            } else {
+                                hasValidCoords = true;
+                                result.coordinates.push({ lat, lng });
+                                
+                                // Add coordinate validation message
+                                rowData['_coordinateStatus'] = '✅ Valid coordinates';
                             }
+                        } else if (rowData['Latitude'] || rowData['Longitude']) {
+                            rowWarnings.push(`Row ${i}: Incomplete coordinates. Provide both Latitude and Longitude or leave both empty.`);
                         }
 
                         // Add to results
@@ -1277,11 +1379,18 @@
                             data: rowData,
                             errors: rowErrors,
                             warnings: rowWarnings,
-                            isValid: rowErrors.length === 0
+                            isValid: rowErrors.length === 0,
+                            hasValidCoords: hasValidCoords,
+                            rowNumber: i
                         });
 
                         if (rowErrors.length === 0) {
                             result.validRows++;
+                            if (rowWarnings.length > 0) {
+                                result.warningRows++;
+                            }
+                        } else {
+                            result.invalidRows++;
                         }
 
                         // Add errors and warnings to overall lists
@@ -1294,13 +1403,16 @@
                             data: null,
                             errors: [error.message],
                             warnings: [],
-                            isValid: false
+                            isValid: false,
+                            hasValidCoords: false,
+                            rowNumber: i
                         });
+                        result.invalidRows++;
                     }
                 }
 
                 // Create summary
-                result.summary = `Found ${result.totalRows} rows, ${result.validRows} valid rows, ${result.errors.length} errors, ${result.warnings.length} warnings`;
+                result.summary = `Found ${result.totalRows} rows: ${result.validRows} valid, ${result.invalidRows} invalid, ${result.warningRows} with warnings`;
 
                 return result;
 
@@ -1313,12 +1425,21 @@
         // Show CSV preview with validation results
         showCSVPreview(validationResult) {
             const previewSection = document.getElementById('csv-preview-section');
+            const statsDiv = document.getElementById('validation-stats');
             const summaryDiv = document.getElementById('validation-summary');
             const previewTable = document.getElementById('csv-preview-table');
+            const miniMapContainer = document.getElementById('mini-map-container');
             
             // Clear previous content
+            statsDiv.innerHTML = '';
             summaryDiv.innerHTML = '';
             previewTable.innerHTML = '';
+            
+            // Show validation statistics
+            statsDiv.style.display = 'flex';
+            document.getElementById('stat-valid-rows').textContent = `✅ ${validationResult.validRows} valid rows`;
+            document.getElementById('stat-invalid-rows').textContent = `❌ ${validationResult.invalidRows} invalid rows`;
+            document.getElementById('stat-warning-rows').textContent = `⚠️ ${validationResult.warningRows} rows with warnings`;
             
             // Show validation summary
             let summaryHTML = `<div class="status-${validationResult.errors.length > 0 ? 'error' : validationResult.warnings.length > 0 ? 'warning' : 'success'} validation-summary">`;
@@ -1326,10 +1447,11 @@
             
             if (validationResult.errors.length > 0) {
                 summaryHTML += '<div class="validation-errors">';
-                summaryHTML += '<strong>Errors:</strong>';
-                validationResult.errors.slice(0, 5).forEach(error => {
-                    summaryHTML += `<div class="validation-error">${error}</div>`;
-                });
+                summaryHTML += '<strong>Critical Errors (must be fixed):</strong>';
+                const errorCount = Math.min(validationResult.errors.length, 5);
+                for (let i = 0; i < errorCount; i++) {
+                    summaryHTML += `<div class="validation-error">${validationResult.errors[i]}</div>`;
+                }
                 if (validationResult.errors.length > 5) {
                     summaryHTML += `<div class="validation-error">... and ${validationResult.errors.length - 5} more errors</div>`;
                 }
@@ -1338,18 +1460,35 @@
             
             if (validationResult.warnings.length > 0) {
                 summaryHTML += '<div class="validation-errors">';
-                summaryHTML += '<strong>Warnings:</strong>';
-                validationResult.warnings.slice(0, 5).forEach(warning => {
-                    summaryHTML += `<div class="validation-warning">${warning}</div>`;
-                });
+                summaryHTML += '<strong>Warnings (should be reviewed):</strong>';
+                const warningCount = Math.min(validationResult.warnings.length, 5);
+                for (let i = 0; i < warningCount; i++) {
+                    summaryHTML += `<div class="validation-warning">${validationResult.warnings[i]}</div>`;
+                }
                 if (validationResult.warnings.length > 5) {
                     summaryHTML += `<div class="validation-warning">... and ${validationResult.warnings.length - 5} more warnings</div>`;
                 }
                 summaryHTML += '</div>';
             }
             
+            // Date format guidance
+            summaryHTML += '<div style="margin-top: 1rem; padding: 0.5rem; background: #e8f4fc; border-radius: 4px;">';
+            summaryHTML += '<strong>📅 Date Format Guidance:</strong><br>';
+            summaryHTML += '• Use ISO format for best results: <code>2023-12-25T14:30:00</code><br>';
+            summaryHTML += '• Or use unambiguous formats: <code>25/12/2023 14:30</code> or <code>12/25/2023 2:30 PM</code><br>';
+            summaryHTML += '• Avoid ambiguous formats like <code>01/02/2023</code> (could be Jan 2 or Feb 1)';
+            summaryHTML += '</div>';
+            
             summaryHTML += '</div>';
             summaryDiv.innerHTML = summaryHTML;
+            
+            // Show mini map for coordinates if available
+            if (validationResult.hasCoordinates && validationResult.coordinates.length > 0) {
+                this.showMiniMap(validationResult.coordinates);
+                miniMapContainer.style.display = 'block';
+            } else {
+                miniMapContainer.style.display = 'none';
+            }
             
             // Show preview table (limit to first 10 rows for performance)
             const maxPreviewRows = 10;
@@ -1365,22 +1504,33 @@
                 
                 // Create table rows
                 rowsToShow.forEach((row, rowIndex) => {
-                    const rowClass = row.errors.length > 0 ? 'error-row' : row.warnings.length > 0 ? 'warning-row' : '';
-                    tableHTML += `<tr class="${rowClass}">`;
+                    let rowClass = '';
+                    let status = '';
+                    
+                    if (row.errors.length > 0) {
+                        rowClass = 'error-row';
+                        status = `❌ ${row.errors.length} error(s)`;
+                    } else if (row.warnings.length > 0) {
+                        rowClass = 'warning-row';
+                        status = `⚠️ ${row.warnings.length} warning(s)`;
+                    } else {
+                        status = '✅ Valid';
+                    }
+                    
+                    // Add coordinate status if available
+                    if (row.data && row.data['_coordinateStatus']) {
+                        status += ` | ${row.data['_coordinateStatus']}`;
+                    }
+                    
+                    tableHTML += `<tr class="${rowClass}" title="Row ${row.rowNumber}">`;
                     
                     validationResult.headers.forEach(header => {
                         const value = row.data ? row.data[header] || '' : '';
-                        const displayValue = value.length > 50 ? value.substring(0, 50) + '...' : value;
-                        tableHTML += `<td title="${this.escapeHtml(value)}">${this.escapeHtml(displayValue)}</td>`;
+                        const displayValue = value.length > 30 ? value.substring(0, 30) + '...' : value;
+                        const title = value.length > 30 ? value : '';
+                        tableHTML += `<td title="${this.escapeHtml(title)}">${this.escapeHtml(displayValue)}</td>`;
                     });
                     
-                    // Status column
-                    let status = '✅ Valid';
-                    if (row.errors.length > 0) {
-                        status = `❌ ${row.errors.length} error(s)`;
-                    } else if (row.warnings.length > 0) {
-                        status = `⚠️ ${row.warnings.length} warning(s)`;
-                    }
                     tableHTML += `<td>${status}</td></tr>`;
                 });
                 
@@ -1399,6 +1549,44 @@
             previewSection.scrollIntoView({ behavior: 'smooth' });
         },
 
+        // Show mini map for coordinate preview
+        showMiniMap(coordinates) {
+            const container = document.getElementById('mini-map-container');
+            container.innerHTML = '';
+            
+            if (coordinates.length === 0) return;
+            
+            // Calculate bounds for all coordinates
+            const bounds = coordinates.reduce((acc, coord) => {
+                if (coord && coord.lat && coord.lng) {
+                    acc.push([coord.lat, coord.lng]);
+                }
+                return acc;
+            }, []);
+            
+            if (bounds.length === 0) return;
+            
+            // Create mini map
+            this.miniMap = L.map(container).setView(bounds[0], 5);
+            
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors',
+                maxZoom: 19
+            }).addTo(this.miniMap);
+            
+            // Add markers for each coordinate
+            coordinates.forEach(coord => {
+                if (coord && coord.lat && coord.lng) {
+                    L.marker([coord.lat, coord.lng]).addTo(this.miniMap);
+                }
+            });
+            
+            // Fit bounds if multiple coordinates
+            if (bounds.length > 1) {
+                this.miniMap.fitBounds(bounds);
+            }
+        },
+
         // Import observations from CSV with proper merging
         importObservations(validationResult, mode = 'append') {
             try {
@@ -1407,7 +1595,7 @@
                 let errorCount = 0;
                 let updateCount = 0;
 
-                // Process valid rows only
+                // Process only valid rows
                 validationResult.rows.forEach(row => {
                     if (row.isValid && row.data) {
                         try {
@@ -1419,7 +1607,7 @@
                                 commonName: row.data['Common Name'] || '',
                                 location: {
                                     text: row.data['Location'] || '',
-                                    coordinates: (row.data['Latitude'] && row.data['Longitude'] && !isNaN(row.data['Latitude']) && !isNaN(row.data['Longitude'])) ? {
+                                    coordinates: (row.data['Latitude'] && row.data['Longitude']) ? {
                                         lat: parseFloat(row.data['Latitude']),
                                         lng: parseFloat(row.data['Longitude'])
                                     } : null,
@@ -1435,7 +1623,8 @@
                                 metadata: {
                                     deviceInfo: 'Imported from CSV',
                                     appVersion: '1.0',
-                                    lastModified: new Date().toISOString()
+                                    lastModified: new Date().toISOString(),
+                                    importDate: new Date().toISOString()
                                 }
                             };
 
@@ -1483,7 +1672,8 @@
                                     metadata: {
                                         ...existingObs.metadata,
                                         lastModified: new Date().toISOString(),
-                                        source: 'merged from CSV'
+                                        source: 'merged from CSV',
+                                        importDate: new Date().toISOString()
                                     }
                                 });
                                 updateCount++;
@@ -1567,51 +1757,58 @@
             
             // Try different date formats
             const formats = [
-                // ISO format
+                // ISO format (YYYY-MM-DDTHH:mm:ss)
+                () => {
+                    try {
+                        // Try standard ISO format
+                        const date = new Date(timestampStr);
+                        if (!isNaN(date.getTime())) return date;
+                        
+                        // Try without timezone
+                        const isoMatch = timestampStr.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/);
+                        if (isoMatch) {
+                            const [_, year, month, day, hour, minute, second] = isoMatch;
+                            const date = new Date(year, month - 1, day, hour, minute, second);
+                            if (!isNaN(date.getTime())) return date;
+                        }
+                        return null;
+                    } catch {
+                        return null;
+                    }
+                },
+                // US format (MM/DD/YYYY HH:MM:SS)
+                () => {
+                    try {
+                        const usMatch = timestampStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})[,\s]+(\d{1,2}):(\d{2}):(\d{2})/);
+                        if (usMatch) {
+                            const [_, month, day, year, hour, minute, second] = usMatch;
+                            const date = new Date(year, month - 1, day, hour, minute, second);
+                            if (!isNaN(date.getTime())) return date;
+                        }
+                        return null;
+                    } catch {
+                        return null;
+                    }
+                },
+                // EU format (DD/MM/YYYY HH:MM:SS)
+                () => {
+                    try {
+                        const euMatch = timestampStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})[,\s]+(\d{1,2}):(\d{2}):(\d{2})/);
+                        if (euMatch) {
+                            const [_, day, month, year, hour, minute, second] = euMatch;
+                            const date = new Date(year, month - 1, day, hour, minute, second);
+                            if (!isNaN(date.getTime())) return date;
+                        }
+                        return null;
+                    } catch {
+                        return null;
+                    }
+                },
+                // Date only (try multiple formats)
                 () => {
                     try {
                         const date = new Date(timestampStr);
-                        return !isNaN(date.getTime()) ? date : null;
-                    } catch {
-                        return null;
-                    }
-                },
-                // Locale format with comma (e.g., "12/25/2023, 2:30:00 PM")
-                () => {
-                    try {
-                        const cleaned = timestampStr.replace(',', '');
-                        const date = new Date(cleaned);
-                        return !isNaN(date.getTime()) ? date : null;
-                    } catch {
-                        return null;
-                    }
-                },
-                // Try parsing as mm/dd/yyyy hh:mm:ss
-                () => {
-                    try {
-                        const parts = timestampStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})[,\s]+(\d{1,2}):(\d{2}):(\d{2})/);
-                        if (parts) {
-                            // Try as mm/dd/yyyy first (US format)
-                            let date = new Date(parts[3], parts[1] - 1, parts[2], parts[4], parts[5], parts[6]);
-                            if (!isNaN(date.getTime())) return date;
-                            
-                            // Try as dd/mm/yyyy (EU format)
-                            date = new Date(parts[3], parts[2] - 1, parts[1], parts[4], parts[5], parts[6]);
-                            return !isNaN(date.getTime()) ? date : null;
-                        }
-                        return null;
-                    } catch {
-                        return null;
-                    }
-                },
-                // Try parsing as yyyy-mm-dd hh:mm:ss
-                () => {
-                    try {
-                        const parts = timestampStr.match(/(\d{4})-(\d{1,2})-(\d{1,2})[,\s]+(\d{1,2}):(\d{2}):(\d{2})/);
-                        if (parts) {
-                            const date = new Date(parts[1], parts[2] - 1, parts[3], parts[4], parts[5], parts[6]);
-                            return !isNaN(date.getTime()) ? date : null;
-                        }
+                        if (!isNaN(date.getTime())) return date;
                         return null;
                     } catch {
                         return null;
@@ -1624,7 +1821,7 @@
                 if (result) return result;
             }
             
-            return null; // Return null if no format worked
+            return null;
         },
 
         // Get filtered observations for export
@@ -1876,8 +2073,15 @@
         // Hide CSV preview
         hideCSVPreview() {
             document.getElementById('csv-preview-section').style.display = 'none';
+            document.getElementById('validation-stats').style.display = 'none';
             document.getElementById('csv-import').value = '';
             this.csvPreviewData = null;
+            
+            // Clean up mini map
+            if (this.miniMap) {
+                this.miniMap.remove();
+                this.miniMap = null;
+            }
         },
 
         // Download CSV template
@@ -1885,7 +2089,7 @@
             const headers = EXPECTED_CSV_HEADERS;
             const exampleRow = [
                 'ECO-20231225-ABC12',
-                '2023-12-25T14:30:00',
+                '2023-12-25T14:30:00', // ISO format example
                 'Jane Doe',
                 'Canis lupus',
                 'Gray Wolf',
@@ -1905,7 +2109,19 @@
                 headers.join(','),
                 exampleRow.map(field => `"${field}"`).join(','),
                 '',
-                'Note: Date format should be ISO (YYYY-MM-DDTHH:mm:ss) or standard locale format'
+                '📅 Date Format Notes:',
+                '• Use ISO format for best results: YYYY-MM-DDTHH:mm:ss (e.g., 2023-12-25T14:30:00)',
+                '• Alternative formats: MM/DD/YYYY HH:MM:SS or DD/MM/YYYY HH:MM:SS',
+                '• Avoid ambiguous formats like 01/02/2023',
+                '',
+                '📍 Coordinate Notes:',
+                '• Latitude: -90 to 90 (negative = South)',
+                '• Longitude: -180 to 180 (negative = West)',
+                '• Use decimal degrees (e.g., 44.4280, -110.5885)',
+                '',
+                '⚠️ Safety Note:',
+                '• Text starting with =, +, -, @ will be prefixed with apostrophe',
+                '• This prevents formula execution in spreadsheet software'
             ].join('\n');
             
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
@@ -2627,39 +2843,52 @@
             }
             
             if (format === 'csv') {
-                this.exportToCSV(filteredObservations);
+                this.exportToCSV(filteredObservations, dateFrom, dateTo, selectedIds);
             } else {
-                this.exportToPDF(filteredObservations);
+                this.exportToPDF(filteredObservations, dateFrom, dateTo, selectedIds);
             }
         },
 
-        // Export to CSV with all fields
-        exportToCSV(observations) {
+        // Export to CSV with all fields and metadata
+        exportToCSV(observations, dateFrom, dateTo, selectedIds) {
             const headers = [
                 'ID', 'Timestamp', 'Observer Name', 'Scientific Name', 'Common Name', 'Location',
                 'Latitude', 'Longitude', 'Habitat', 'Observation Type',
                 'Characteristics', 'Equipment', 'References', 'Notes', 'Has Photo'
             ];
             
+            // Create metadata header
+            const metadata = [
+                `Export Metadata:`,
+                `Exported: ${new Date().toLocaleString()}`,
+                `Total Observations: ${observations.length}`,
+                `Date Range: ${dateFrom || 'Start'} to ${dateTo || 'End'}`,
+                `Selection: ${selectedIds ? 'Custom selection' : 'All observations'}`,
+                `Exported by: ${observations[0]?.observerName || 'EcoLens User'}`,
+                `App Version: 1.0`,
+                ``
+            ];
+            
             const rows = observations.map(obs => [
-                `"${obs.id}"`,
+                `"${this.sanitizeCSVValue(obs.id)}"`,
                 `"${new Date(obs.timestamp).toLocaleString()}"`,
-                `"${obs.observerName.replace(/"/g, '""')}"`,
-                `"${obs.scientificName.replace(/"/g, '""')}"`,
-                `"${obs.commonName.replace(/"/g, '""')}"`,
-                `"${obs.location.text.replace(/"/g, '""')}"`,
+                `"${this.sanitizeCSVValue(obs.observerName)}"`,
+                `"${this.sanitizeCSVValue(obs.scientificName)}"`,
+                `"${this.sanitizeCSVValue(obs.commonName)}"`,
+                `"${this.sanitizeCSVValue(obs.location.text)}"`,
                 obs.location.coordinates?.lat || '',
                 obs.location.coordinates?.lng || '',
-                `"${obs.habitat}"`,
-                `"${obs.observationType}"`,
-                `"${(obs.characteristics || '').replace(/"/g, '""')}"`,
-                `"${(obs.equipment || []).join('; ').replace(/"/g, '""')}"`,
-                `"${(obs.references || '').replace(/"/g, '""')}"`,
-                `"${(obs.notes || '').replace(/"/g, '""')}"`,
+                `"${this.sanitizeCSVValue(obs.habitat)}"`,
+                `"${this.sanitizeCSVValue(obs.observationType)}"`,
+                `"${this.sanitizeCSVValue(obs.characteristics || '')}"`,
+                `"${this.sanitizeCSVValue((obs.equipment || []).join('; '))}"`,
+                `"${this.sanitizeCSVValue(obs.references || '')}"`,
+                `"${this.sanitizeCSVValue(obs.notes || '')}"`,
                 obs.photo ? 'Yes' : 'No'
             ]);
             
             const csvContent = [
+                ...metadata,
                 headers.join(','),
                 ...rows.map(row => row.join(','))
             ].join('\n');
@@ -2675,8 +2904,8 @@
             this.showStatus(`Exported ${observations.length} observations to CSV`, 'success', 'export');
         },
 
-        // Export to PDF with improved layout using AutoTable
-        exportToPDF(observations) {
+        // Export to PDF - RESTORED original layout with photos
+        exportToPDF(observations, dateFrom, dateTo, selectedIds) {
             if (this.isGeneratingPDF) {
                 this.showStatus('PDF generation already in progress', 'warning', 'export');
                 return;
@@ -2715,41 +2944,63 @@
             const totalObservations = observations.length;
             let processedObservations = 0;
 
-            // Helper function to add a table using AutoTable
-            const addObservationTable = (obs, index) => {
-                const tableData = [
-                    ['Field', 'Value'],
-                    ['ID', obs.id],
-                    ['Date/Time', new Date(obs.timestamp).toLocaleString()],
-                    ['Observer', obs.observerName],
-                    ['Scientific Name', obs.scientificName],
-                    ['Common Name', obs.commonName || 'Not specified'],
-                    ['Location', obs.location.text],
-                    ['Coordinates', obs.location.coordinates ? 
-                        `Lat: ${obs.location.coordinates.lat.toFixed(5)}, Lng: ${obs.location.coordinates.lng.toFixed(5)}` : 'Not recorded'],
-                    ['Habitat', this.capitalizeFirst(obs.habitat)],
-                    ['Observation Type', this.formatObservationType(obs.observationType)],
-                    ['Equipment', obs.equipment.map(eq => this.formatEquipment(eq)).join(', ') || 'None'],
-                    ['References', obs.references || 'None']
-                ];
+            // Helper function to check if we need a new page
+            const checkPageSpace = (requiredSpace) => {
+                if (y + requiredSpace > pageHeight - margin) {
+                    doc.addPage();
+                    currentPage++;
+                    y = margin;
+                    
+                    // Add page header
+                    doc.setFontSize(10);
+                    doc.setTextColor(100);
+                    doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
+                    y += 5;
+                    
+                    // Add page separator
+                    doc.setDrawColor(200);
+                    doc.line(margin, y, pageWidth - margin, y);
+                    y += 10;
+                    return true;
+                }
+                return false;
+            };
 
-                doc.autoTable({
-                    startY: y,
-                    head: [tableData[0]],
-                    body: tableData.slice(1),
-                    theme: 'grid',
-                    headStyles: { fillColor: [44, 62, 80], textColor: 255 },
-                    styles: { fontSize: 9, cellPadding: 3 },
-                    columnStyles: {
-                        0: { fontStyle: 'bold', cellWidth: 40 },
-                        1: { cellWidth: contentWidth - 40 }
-                    },
-                    margin: { left: margin, right: margin },
-                    didDrawPage: (data) => {
-                        // Update y position after table
-                        y = data.cursor.y + 10;
+            // Helper function to add text with word wrap and return new y position
+            const addWrappedText = (text, x, startY, maxWidth, lineHeight = 6) => {
+                if (!text || text.trim() === '') return startY;
+                
+                const lines = doc.splitTextToSize(text, maxWidth);
+                
+                // Check if we have enough space
+                if (checkPageSpace(lines.length * lineHeight)) {
+                    startY = y;
+                }
+                
+                lines.forEach((line, index) => {
+                    // Check for each line if we need new page
+                    if (startY + (index * lineHeight) > pageHeight - margin) {
+                        doc.addPage();
+                        currentPage++;
+                        y = margin;
+                        startY = y;
+                        
+                        // Add page header
+                        doc.setFontSize(10);
+                        doc.setTextColor(100);
+                        doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
+                        y += 5;
+                        
+                        // Add page separator
+                        doc.setDrawColor(200);
+                        doc.line(margin, y, pageWidth - margin, y);
+                        y += 10;
+                        startY = y;
                     }
+                    doc.text(line, x, startY + (index * lineHeight));
                 });
+                
+                return startY + (lines.length * lineHeight);
             };
 
             // Update progress
@@ -2767,7 +3018,7 @@
             // Generate PDF asynchronously to show progress
             setTimeout(async () => {
                 try {
-                    // Cover page
+                    // Cover page with metadata
                     updateProgress('cover', 'Creating cover page...');
                     
                     doc.setFontSize(24);
@@ -2779,13 +3030,11 @@
                     doc.setTextColor(80);
                     doc.text('Field Observation Report', pageWidth / 2, 75, { align: 'center' });
                     
-                    // Report details
+                    // Report metadata
                     doc.setFontSize(12);
                     doc.setFont('helvetica', 'normal');
                     y = 100;
                     
-                    const dateFrom = document.getElementById('date-from').value;
-                    const dateTo = document.getElementById('date-to').value;
                     let dateRangeText = 'All observations';
                     if (dateFrom || dateTo) {
                         dateRangeText = `From: ${dateFrom || 'Start'} to ${dateTo || 'End'}`;
@@ -2795,108 +3044,447 @@
                     y += 10;
                     doc.text(`Total Observations: ${totalObservations}`, pageWidth / 2, y, { align: 'center' });
                     y += 10;
-                    doc.text(`Generated: ${new Date().toLocaleString()}`, pageWidth / 2, y, { align: 'center' });
+                    doc.text(`Exported: ${new Date().toLocaleString()}`, pageWidth / 2, y, { align: 'center' });
+                    y += 10;
+                    doc.text(`Selection: ${selectedIds ? 'Custom selection' : 'All observations'}`, pageWidth / 2, y, { align: 'center' });
+                    y += 10;
+                    doc.text(`Exported by: ${observations[0]?.observerName || 'EcoLens User'}`, pageWidth / 2, y, { align: 'center' });
+                    y += 20;
+                    
+                    doc.setFontSize(10);
+                    doc.setTextColor(100);
+                    doc.text('This report contains detailed field observations including photos,', pageWidth / 2, y, { align: 'center' });
+                    y += 5;
+                    doc.text('location data, and comprehensive metadata for each record.', pageWidth / 2, y, { align: 'center' });
+                    
+                    // Table of contents
+                    doc.addPage();
+                    currentPage++;
+                    y = margin;
+                    
+                    // Add page header
+                    doc.setFontSize(10);
+                    doc.setTextColor(100);
+                    doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
+                    y += 5;
+                    
+                    // Add page separator
+                    doc.setDrawColor(200);
+                    doc.line(margin, y, pageWidth - margin, y);
+                    y += 10;
+                    
+                    updateProgress('toc', 'Creating table of contents...');
+                    
+                    // Table of contents header
+                    doc.setFontSize(12);
+                    doc.setFont('helvetica', 'bold');
+                    doc.setTextColor(40, 40, 40);
+                    doc.text('Table of Contents', margin, y);
+                    y += 8;
+                    
+                    // Add underline
+                    doc.setDrawColor(100, 150, 100);
+                    doc.line(margin, y, margin + 50, y);
+                    y += 10;
+                    
+                    doc.setFontSize(10);
+                    doc.setFont('helvetica', 'normal');
+                    doc.setTextColor(60);
+                    
+                    y += 10;
+                    observations.forEach((obs, index) => {
+                        // Check space for each TOC entry
+                        checkPageSpace(7);
+                        const entry = `${index + 1}. ${obs.scientificName} (${obs.id})`;
+                        doc.text(entry, margin, y);
+                        y += 7;
+                    });
                     
                     // Process each observation
                     for (let i = 0; i < observations.length; i++) {
                         const obs = observations[i];
                         
-                        // Add new page for each observation (except first)
-                        if (i > 0) {
-                            doc.addPage();
-                            currentPage++;
-                            y = margin;
-                        }
+                        // Add new page for each observation
+                        doc.addPage();
+                        currentPage++;
+                        y = margin;
+                        
+                        // Add page header
+                        doc.setFontSize(10);
+                        doc.setTextColor(100);
+                        doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
+                        y += 5;
+                        
+                        // Add page separator
+                        doc.setDrawColor(200);
+                        doc.line(margin, y, pageWidth - margin, y);
+                        y += 10;
                         
                         updateProgress('observation', `Adding observation: ${obs.scientificName}`);
                         
                         // Observation header
+                        checkPageSpace(20); // Space for header
                         doc.setFontSize(14);
                         doc.setFont('helvetica', 'bold');
                         doc.setTextColor(40, 40, 40);
-                        doc.text(`Observation ${i + 1}: ${obs.scientificName}`, margin, y);
-                        y += 8;
-                        
-                        // Add underline
-                        doc.setDrawColor(100, 150, 100);
-                        doc.line(margin, y, margin + 50, y);
+                        doc.text(`Observation ${i + 1}: ${obs.id}`, margin, y);
                         y += 10;
                         
-                        // Add observation table
-                        addObservationTable(obs, i);
+                        // Observation details in two columns
+                        const col1X = margin;
+                        const col2X = margin + (contentWidth / 2) + 5;
+                        const columnWidth = (contentWidth / 2) - 5;
                         
-                        // Add characteristics if present
+                        // Start columns at same y position
+                        let col1Y = y;
+                        let col2Y = y;
+                        
+                        // COLUMN 1: Basic Information
+                        doc.setFontSize(10);
+                        doc.setFont('helvetica', 'bold');
+                        doc.text('BASIC INFORMATION', col1X, col1Y);
+                        col1Y += 7; // Space after heading
+                        doc.setFont('helvetica', 'normal');
+                        
+                        // Add key-value pairs in column 1
+                        const col1Items = [
+                            { key: 'Date/Time', value: new Date(obs.timestamp).toLocaleString() },
+                            { key: 'Observer', value: obs.observerName },
+                            { key: 'Scientific Name', value: obs.scientificName },
+                            { key: 'Common Name', value: obs.commonName || 'Not specified' },
+                            { key: 'Habitat', value: this.capitalizeFirst(obs.habitat) },
+                            { key: 'Observation Type', value: this.formatObservationType(obs.observationType) }
+                        ];
+                        
+                        col1Items.forEach(item => {
+                            doc.setFont('helvetica', 'bold');
+                            const keyText = `${item.key}: `;
+                            const keyWidth = doc.getTextWidth(keyText);
+                            doc.text(keyText, col1X, col1Y);
+                            
+                            doc.setFont('helvetica', 'normal');
+                            const wrappedLines = doc.splitTextToSize(item.value, columnWidth - keyWidth);
+                            
+                            // Handle multi-line values
+                            if (wrappedLines.length === 1) {
+                                doc.text(item.value, col1X + keyWidth, col1Y);
+                                col1Y += 5;
+                            } else {
+                                // First line
+                                doc.text(wrappedLines[0], col1X + keyWidth, col1Y);
+                                col1Y += 5;
+                                
+                                // Subsequent lines (indented)
+                                for (let j = 1; j < wrappedLines.length; j++) {
+                                    doc.text(wrappedLines[j], col1X + keyWidth, col1Y);
+                                    col1Y += 5;
+                                }
+                            }
+                            col1Y += 1; // Extra space between items
+                        });
+                        
+                        // COLUMN 2: Location & Equipment
+                        doc.setFont('helvetica', 'bold');
+                        doc.text('LOCATION & EQUIPMENT', col2X, col2Y);
+                        col2Y += 7; // Space after heading
+                        doc.setFont('helvetica', 'normal');
+                        
+                        // Add key-value pairs in column 2
+                        const col2Items = [];
+                        
+                        // Location text
+                        col2Items.push({ key: 'Location', value: obs.location.text });
+                        
+                        // Coordinates if available
+                        if (obs.location.coordinates) {
+                            const coords = `Lat: ${obs.location.coordinates.lat.toFixed(5)}, Lng: ${obs.location.coordinates.lng.toFixed(5)}`;
+                            col2Items.push({ key: 'Coordinates', value: coords });
+                        }
+                        
+                        // Accuracy if available
+                        if (obs.location.accuracy) {
+                            col2Items.push({ key: 'Accuracy', value: `±${Math.round(obs.location.accuracy)} meters` });
+                        }
+                        
+                        // Equipment if available
+                        if (obs.equipment && obs.equipment.length > 0) {
+                            const equipmentText = obs.equipment.map(eq => this.formatEquipment(eq)).join(', ');
+                            col2Items.push({ key: 'Equipment Used', value: equipmentText });
+                        }
+                        
+                        // References if available
+                        if (obs.references) {
+                            col2Items.push({ key: 'References', value: obs.references });
+                        }
+                        
+                        col2Items.forEach(item => {
+                            doc.setFont('helvetica', 'bold');
+                            const keyText = `${item.key}: `;
+                            const keyWidth = doc.getTextWidth(keyText);
+                            doc.text(keyText, col2X, col2Y);
+                            
+                            doc.setFont('helvetica', 'normal');
+                            const wrappedLines = doc.splitTextToSize(item.value, columnWidth - keyWidth);
+                            
+                            // Handle multi-line values
+                            if (wrappedLines.length === 1) {
+                                doc.text(item.value, col2X + keyWidth, col2Y);
+                                col2Y += 5;
+                            } else {
+                                // First line
+                                doc.text(wrappedLines[0], col2X + keyWidth, col2Y);
+                                col2Y += 5;
+                                
+                                // Subsequent lines (indented)
+                                for (let j = 1; j < wrappedLines.length; j++) {
+                                    doc.text(wrappedLines[j], col2X + keyWidth, col2Y);
+                                    col2Y += 5;
+                                }
+                            }
+                            col2Y += 1; // Extra space between items
+                        });
+                        
+                        // Set y to the bottom of the tallest column
+                        y = Math.max(col1Y, col2Y) + 10;
+                        
+                        // Characteristics section
                         if (obs.characteristics) {
-                            doc.setFontSize(11);
+                            // Add section spacing
+                            y += 5;
+                            checkPageSpace(15);
+                            
+                            // Section header
+                            doc.setFontSize(12);
                             doc.setFont('helvetica', 'bold');
-                            doc.text('Description / Characteristics:', margin, y);
-                            y += 7;
+                            doc.setTextColor(40, 40, 40);
+                            doc.text('DESCRIPTION / CHARACTERISTICS', margin, y);
+                            y += 8;
+                            
+                            // Add underline
+                            doc.setDrawColor(100, 150, 100);
+                            doc.line(margin, y, margin + 50, y);
+                            y += 10;
                             
                             doc.setFontSize(10);
                             doc.setFont('helvetica', 'normal');
-                            const charLines = doc.splitTextToSize(obs.characteristics, contentWidth);
-                            charLines.forEach(line => {
-                                doc.text(line, margin, y);
-                                y += 5;
-                            });
-                            y += 5;
+                            doc.setTextColor(60);
+                            
+                            y = addWrappedText(obs.characteristics, margin, y, contentWidth, 5);
+                            y += 10;
                         }
                         
-                        // Add notes if present
+                        // Notes section
                         if (obs.notes) {
-                            doc.setFontSize(11);
+                            // Add section spacing
+                            y += 5;
+                            checkPageSpace(15);
+                            
+                            // Section header
+                            doc.setFontSize(12);
                             doc.setFont('helvetica', 'bold');
-                            doc.text('Additional Notes:', margin, y);
-                            y += 7;
+                            doc.setTextColor(40, 40, 40);
+                            doc.text('ADDITIONAL NOTES', margin, y);
+                            y += 8;
+                            
+                            // Add underline
+                            doc.setDrawColor(100, 150, 100);
+                            doc.line(margin, y, margin + 50, y);
+                            y += 10;
                             
                             doc.setFontSize(10);
                             doc.setFont('helvetica', 'normal');
-                            const notesLines = doc.splitTextToSize(obs.notes, contentWidth);
-                            notesLines.forEach(line => {
-                                doc.text(line, margin, y);
-                                y += 5;
-                            });
-                            y += 5;
+                            doc.setTextColor(60);
+                            
+                            y = addWrappedText(obs.notes, margin, y, contentWidth, 5);
+                            y += 10;
                         }
                         
-                        // Add photo placeholder if present
+                        // Photo section - RESTORED photo inclusion
                         if (obs.photo && obs.photo.data) {
+                            // Add section spacing
+                            y += 5;
+                            checkPageSpace(15);
+                            
+                            // Section header
+                            doc.setFontSize(12);
+                            doc.setFont('helvetica', 'bold');
+                            doc.setTextColor(40, 40, 40);
+                            doc.text('PHOTO / EVIDENCE', margin, y);
+                            y += 8;
+                            
+                            // Add underline
+                            doc.setDrawColor(100, 150, 100);
+                            doc.line(margin, y, margin + 50, y);
+                            y += 10;
+                            
                             try {
-                                doc.setFontSize(11);
-                                doc.setFont('helvetica', 'bold');
-                                doc.text('Photo / Evidence:', margin, y);
-                                y += 7;
+                                updateProgress('photo', `Adding photo for: ${obs.scientificName}`);
+                                
+                                // Check if we have enough space for the photo (80mm minimum)
+                                checkPageSpace(80);
                                 
                                 // Add photo caption
                                 doc.setFontSize(9);
-                                doc.setFont('helvetica', 'italic');
-                                doc.text('Photo included in original observation', margin, y);
+                                doc.setTextColor(80);
+                                doc.text('Observation Photo:', margin, y);
                                 y += 5;
+                                
+                                // Add photo with fixed aspect ratio
+                                const maxImgWidth = contentWidth;
+                                const maxImgHeight = 80; // Max height for photos
+                                
+                                // Convert base64 to image object
+                                const img = new Image();
+                                await new Promise((resolve, reject) => {
+                                    img.onload = resolve;
+                                    img.onerror = reject;
+                                    img.src = obs.photo.data;
+                                });
+                                
+                                // Calculate dimensions maintaining aspect ratio
+                                let imgWidth = img.width;
+                                let imgHeight = img.height;
+                                const aspectRatio = imgWidth / imgHeight;
+                                
+                                if (imgWidth > maxImgWidth) {
+                                    imgWidth = maxImgWidth;
+                                    imgHeight = imgWidth / aspectRatio;
+                                }
+                                
+                                if (imgHeight > maxImgHeight) {
+                                    imgHeight = maxImgHeight;
+                                    imgWidth = imgHeight * aspectRatio;
+                                }
+                                
+                                // Center the image
+                                const imgX = margin + (contentWidth - imgWidth) / 2;
+                                
+                                // Add image to PDF
+                                doc.addImage(
+                                    img,
+                                    'JPEG',
+                                    imgX,
+                                    y,
+                                    imgWidth,
+                                    imgHeight
+                                );
+                                
+                                y += imgHeight + 10;
+                                
+                                // Add photo metadata
+                                doc.setFontSize(8);
+                                doc.setTextColor(100);
+                                const imgMetadata = `File: ${obs.photo.filename || 'photo.jpg'} | Included in record`;
+                                doc.text(imgMetadata, margin, y);
+                                y += 6;
+                                
                             } catch (error) {
-                                console.error('Error adding photo reference:', error);
+                                console.error('Error adding photo to PDF:', error);
+                                doc.setFontSize(9);
+                                doc.setTextColor(150, 0, 0);
+                                doc.text('Photo could not be included in PDF (format issue)', margin, y);
+                                y += 10;
                             }
                         }
                         
-                        // Add separator if not last observation
+                        // Metadata footer
+                        doc.setFontSize(8);
+                        doc.setTextColor(120);
+                        doc.setFont('helvetica', 'italic');
+                        
+                        // Check space for metadata
+                        checkPageSpace(20);
+                        
+                        const metadataLines = [
+                            `Record ID: ${obs.id}`,
+                            `Created: ${new Date(obs.timestamp).toLocaleString()}`,
+                            `Last Modified: ${new Date(obs.metadata.lastModified).toLocaleString()}`,
+                            `Device: ${obs.metadata.deviceInfo.substring(0, 40)}...`
+                        ];
+                        
+                        metadataLines.forEach(line => {
+                            doc.text(line, margin, y);
+                            y += 4;
+                        });
+                        
+                        y += 10;
+                        
+                        // Add page separator if not last observation
                         if (i < observations.length - 1) {
+                            checkPageSpace(15);
                             doc.setDrawColor(200);
                             doc.setLineWidth(0.5);
                             doc.line(margin, y, pageWidth - margin, y);
-                            y += 10;
+                            y += 15;
                         }
                     }
                     
-                    // Add summary page
+                    // Final page - summary
                     doc.addPage();
                     currentPage++;
                     y = margin;
                     
+                    // Add page header
+                    doc.setFontSize(10);
+                    doc.setTextColor(100);
+                    doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
+                    y += 5;
+                    
+                    // Add page separator
+                    doc.setDrawColor(200);
+                    doc.line(margin, y, pageWidth - margin, y);
+                    y += 10;
+                    
+                    updateProgress('summary', 'Adding summary page...');
+                    
                     // Summary header
-                    doc.setFontSize(14);
+                    doc.setFontSize(12);
                     doc.setFont('helvetica', 'bold');
                     doc.setTextColor(40, 40, 40);
-                    doc.text('Report Summary', pageWidth / 2, y, { align: 'center' });
-                    y += 15;
+                    doc.text('REPORT SUMMARY', margin, y);
+                    y += 8;
+                    
+                    // Add underline
+                    doc.setDrawColor(100, 150, 100);
+                    doc.line(margin, y, margin + 50, y);
+                    y += 10;
+                    
+                    doc.setFontSize(10);
+                    doc.setFont('helvetica', 'normal');
+                    doc.setTextColor(60);
+                    
+                    y += 10;
+                    
+                    // Export metadata
+                    doc.setFontSize(11);
+                    doc.setFont('helvetica', 'bold');
+                    doc.text('Export Information:', margin, y);
+                    y += 10;
+                    
+                    doc.setFont('helvetica', 'normal');
+                    doc.setFontSize(10);
+                    
+                    const exportInfo = [
+                        `Exported: ${new Date().toLocaleString()}`,
+                        `Total Observations: ${totalObservations}`,
+                        `Date Range: ${dateFrom || 'Start'} to ${dateTo || 'End'}`,
+                        `Selection: ${selectedIds ? 'Custom selection' : 'All observations'}`,
+                        `Exported by: ${observations[0]?.observerName || 'EcoLens User'}`
+                    ];
+                    
+                    exportInfo.forEach(info => {
+                        doc.text(info, margin, y);
+                        y += 5;
+                    });
+                    
+                    y += 10;
+                    
+                    // Statistics
+                    doc.setFont('helvetica', 'bold');
+                    doc.text('Statistics:', margin, y);
+                    y += 10;
+                    
+                    doc.setFont('helvetica', 'normal');
                     
                     // Count by habitat
                     const habitatCount = {};
@@ -2904,22 +3492,16 @@
                         habitatCount[obs.habitat] = (habitatCount[obs.habitat] || 0) + 1;
                     });
                     
-                    const habitatTableData = [['Habitat', 'Count']];
+                    doc.text('Observations by Habitat Type:', margin, y);
+                    y += 7;
+                    
                     Object.entries(habitatCount).forEach(([habitat, count]) => {
-                        habitatTableData.push([this.capitalizeFirst(habitat), count.toString()]);
+                        checkPageSpace(5);
+                        doc.text(`  ${this.capitalizeFirst(habitat)}: ${count}`, margin + 5, y);
+                        y += 5;
                     });
                     
-                    doc.autoTable({
-                        startY: y,
-                        head: [habitatTableData[0]],
-                        body: habitatTableData.slice(1),
-                        theme: 'striped',
-                        headStyles: { fillColor: [44, 62, 80], textColor: 255 },
-                        styles: { fontSize: 10 },
-                        margin: { left: margin, right: margin }
-                    });
-                    
-                    y = doc.lastAutoTable.finalY + 15;
+                    y += 5;
                     
                     // Count by observation type
                     const typeCount = {};
@@ -2927,23 +3509,33 @@
                         typeCount[obs.observationType] = (typeCount[obs.observationType] || 0) + 1;
                     });
                     
-                    const typeTableData = [['Observation Type', 'Count']];
+                    doc.text('Observations by Type:', margin, y);
+                    y += 7;
+                    
                     Object.entries(typeCount).forEach(([type, count]) => {
-                        typeTableData.push([this.formatObservationType(type), count.toString()]);
+                        checkPageSpace(5);
+                        doc.text(`  ${this.formatObservationType(type)}: ${count}`, margin + 5, y);
+                        y += 5;
                     });
                     
-                    doc.autoTable({
-                        startY: y,
-                        head: [typeTableData[0]],
-                        body: typeTableData.slice(1),
-                        theme: 'striped',
-                        headStyles: { fillColor: [44, 62, 80], textColor: 255 },
-                        styles: { fontSize: 10 },
-                        margin: { left: margin, right: margin }
-                    });
+                    y += 10;
+                    
+                    // Photos summary
+                    const photoCount = observations.filter(obs => obs.photo).length;
+                    doc.text(`Total photos included: ${photoCount}`, margin, y);
+                    y += 7;
+                    
+                    // Date range
+                    const dates = observations.map(obs => new Date(obs.timestamp)).sort((a, b) => a - b);
+                    if (dates.length > 0) {
+                        const firstDate = dates[0].toLocaleDateString();
+                        const lastDate = dates[dates.length - 1].toLocaleDateString();
+                        doc.text(`Date range: ${firstDate} to ${lastDate}`, margin, y);
+                        y += 7;
+                    }
                     
                     // Final message
-                    y = doc.lastAutoTable.finalY + 20;
+                    y += 10;
                     doc.setFont('helvetica', 'italic');
                     doc.setTextColor(100);
                     doc.text('--- End of Report ---', pageWidth / 2, y, { align: 'center' });
@@ -2951,7 +3543,7 @@
                     // Save PDF
                     updateProgress('save', 'Finalizing PDF...');
                     
-                    const filename = this.selectedObservations.size > 0 ?
+                    const filename = selectedIds ?
                         `EcoLens_Selected_Report_${new Date().toISOString().slice(0,10)}.pdf` :
                         `EcoLens_Field_Log_${new Date().toISOString().slice(0,10)}.pdf`;
                     
