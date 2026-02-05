@@ -1156,33 +1156,61 @@
             return `ECO-${date}-${random}`.toUpperCase();
         },
 
-        // Create a new observation object with all fields
-        createObservation(data) {
-            const dateTime = new Date(data.date + 'T' + data.time);
-            return {
-                id: this.generateObservationId(),
-                timestamp: dateTime.toISOString(),
-                observerName: data.observerName.trim(),
-                scientificName: data.scientificName.trim(),
-                commonName: data.commonName?.trim() || '',
-                location: {
-                    text: data.location.trim(),
+        // Unified observation normalization function
+        normalizeObservation(data) {
+            // Generate ID if not provided
+            const id = data.id || this.generateObservationId();
+            
+            // Parse and validate timestamp
+            let timestamp;
+            if (data.timestamp instanceof Date) {
+                timestamp = data.timestamp.toISOString();
+            } else if (typeof data.timestamp === 'string') {
+                const date = new Date(data.timestamp);
+                timestamp = !isNaN(date.getTime()) ? date.toISOString() : new Date().toISOString();
+            } else {
+                timestamp = new Date().toISOString();
+            }
+            
+            // Ensure location object structure
+            let location = data.location;
+            if (typeof location === 'string' || !location) {
+                location = {
+                    text: location || '',
                     coordinates: data.coordinates || null,
                     accuracy: data.accuracy || null
-                },
-                habitat: data.habitat,
-                observationType: data.observationType,
-                characteristics: data.characteristics?.trim() || '',
-                notes: data.notes?.trim() || '',
-                equipment: data.equipment || [],
-                references: data.references?.trim() || '',
-                photo: data.photo,
+                };
+            }
+            
+            return {
+                id,
+                timestamp,
+                observerName: (data.observerName || '').trim(),
+                scientificName: (data.scientificName || '').trim(),
+                commonName: (data.commonName || '').trim(),
+                location,
+                habitat: data.habitat || '',
+                observationType: data.observationType || 'direct',
+                characteristics: (data.characteristics || '').trim(),
+                notes: (data.notes || '').trim(),
+                equipment: Array.isArray(data.equipment) ? data.equipment : (data.equipment ? data.equipment.split(';').map(e => e.trim()).filter(e => e) : []),
+                references: (data.references || '').trim(),
+                photo: data.photo || null,
                 metadata: {
-                    deviceInfo: navigator.userAgent,
+                    deviceInfo: data.metadata?.deviceInfo || (data.source === 'import' ? 'Imported from CSV' : navigator.userAgent),
                     appVersion: '1.0',
-                    lastModified: new Date().toISOString()
+                    lastModified: new Date().toISOString(),
+                    source: data.metadata?.source || (data.source || 'manual')
                 }
             };
+        },
+
+        // Create a new observation object with all fields
+        createObservation(data) {
+            return this.normalizeObservation({
+                ...data,
+                timestamp: new Date(data.date + 'T' + data.time)
+            });
         },
 
         // Save observation to localStorage
@@ -1207,14 +1235,14 @@
         updateObservation(id, data) {
             const index = this.observations.findIndex(obs => obs.id === id);
             if (index !== -1) {
-                this.observations[index] = {
+                const updatedObservation = this.normalizeObservation({
                     ...this.observations[index],
                     ...data,
-                    metadata: {
-                        ...this.observations[index].metadata,
-                        lastModified: new Date().toISOString()
-                    }
-                };
+                    id: this.observations[index].id, // Preserve original ID
+                    timestamp: data.timestamp || this.observations[index].timestamp
+                });
+                
+                this.observations[index] = updatedObservation;
                 localStorage.setItem('ecolens_observations', JSON.stringify(this.observations));
                 this.renderLogbook();
                 return true;
@@ -1263,6 +1291,16 @@
             return value;
         },
 
+        // Helper function for date parsing with warnings
+        parseDateWithWarning(value, context = '') {
+            const date = this.parseCSVTimestamp(value);
+            if (!date || isNaN(date.getTime())) {
+                console.warn(`Invalid date format${context ? ' in ' + context : ''}: "${value}"`);
+                return null;
+            }
+            return date;
+        },
+
         // Validate and parse CSV data with detailed error reporting
         validateAndParseCSV(csvContent) {
             const result = {
@@ -1282,6 +1320,7 @@
             try {
                 const lines = csvContent.split('\n').filter(line => line.trim() !== '');
                 if (lines.length < 2) {
+                    console.warn('CSV file is empty or has no data rows');
                     throw new Error('CSV file is empty or has no data rows');
                 }
 
@@ -1294,11 +1333,15 @@
                 const extraHeaders = result.headers.filter(h => !EXPECTED_CSV_HEADERS.includes(h));
 
                 if (missingHeaders.length > 0) {
-                    result.warnings.push(`Missing expected headers: ${missingHeaders.join(', ')}`);
+                    const warning = `Missing expected headers: ${missingHeaders.join(', ')}`;
+                    result.warnings.push(warning);
+                    console.warn(warning);
                 }
 
                 if (extraHeaders.length > 0) {
-                    result.warnings.push(`Extra headers found: ${extraHeaders.join(', ')}`);
+                    const warning = `Extra headers found: ${extraHeaders.join(', ')}`;
+                    result.warnings.push(warning);
+                    console.warn(warning);
                 }
 
                 // Check if CSV has coordinate columns
@@ -1333,23 +1376,20 @@
                             if (result.headers.includes(header)) {
                                 const value = rowData[header];
                                 if (!value || value.trim() === '') {
-                                    rowErrors.push(`Row ${i}: Missing required field "${header}"`);
+                                    const error = `Row ${i}: Missing required field "${header}"`;
+                                    rowErrors.push(error);
+                                    console.warn(error);
                                 }
                             }
                         });
 
                         // Validate date format with clear guidance
                         if (result.headers.includes('Timestamp') && rowData['Timestamp']) {
-                            const date = this.parseCSVTimestamp(rowData['Timestamp']);
-                            if (!date || isNaN(date.getTime())) {
-                                rowWarnings.push(`Row ${i}: Invalid date format. Use ISO format (YYYY-MM-DDTHH:mm:ss) like "2023-12-25T14:30:00"`);
-                            } else {
+                            const date = this.parseDateWithWarning(rowData['Timestamp'], `row ${i}`);
+                            if (date) {
                                 rowData['_parsedTimestamp'] = date;
-                                // Check if date format might be ambiguous
-                                const dateStr = rowData['Timestamp'];
-                                if (dateStr.includes('/')) {
-                                    rowWarnings.push(`Row ${i}: Using date with slashes (/) - ensure format is MM/DD/YYYY or DD/MM/YYYY consistently`);
-                                }
+                            } else {
+                                rowWarnings.push(`Row ${i}: Invalid date format. Use ISO format (YYYY-MM-DDTHH:mm:ss) like "2023-12-25T14:30:00"`);
                             }
                         }
 
@@ -1360,9 +1400,13 @@
                             const lng = parseFloat(rowData['Longitude']);
                             
                             if (isNaN(lat) || lat < -90 || lat > 90) {
-                                rowWarnings.push(`Row ${i}: Invalid Latitude value "${rowData['Latitude']}". Must be between -90 and 90.`);
+                                const warning = `Row ${i}: Invalid Latitude value "${rowData['Latitude']}". Must be between -90 and 90.`;
+                                rowWarnings.push(warning);
+                                console.warn(warning);
                             } else if (isNaN(lng) || lng < -180 || lng > 180) {
-                                rowWarnings.push(`Row ${i}: Invalid Longitude value "${rowData['Longitude']}". Must be between -180 and 180.`);
+                                const warning = `Row ${i}: Invalid Longitude value "${rowData['Longitude']}". Must be between -180 and 180.`;
+                                rowWarnings.push(warning);
+                                console.warn(warning);
                             } else {
                                 hasValidCoords = true;
                                 result.coordinates.push({ lat, lng });
@@ -1371,7 +1415,9 @@
                                 rowData['_coordinateStatus'] = '✅ Valid coordinates';
                             }
                         } else if (rowData['Latitude'] || rowData['Longitude']) {
-                            rowWarnings.push(`Row ${i}: Incomplete coordinates. Provide both Latitude and Longitude or leave both empty.`);
+                            const warning = `Row ${i}: Incomplete coordinates. Provide both Latitude and Longitude or leave both empty.`;
+                            rowWarnings.push(warning);
+                            console.warn(warning);
                         }
 
                         // Add to results
@@ -1398,7 +1444,9 @@
                         result.warnings.push(...rowWarnings);
 
                     } catch (error) {
-                        result.errors.push(`Row ${i}: ${error.message}`);
+                        const errorMsg = `Row ${i}: ${error.message}`;
+                        result.errors.push(errorMsg);
+                        console.error(errorMsg);
                         result.rows.push({
                             data: null,
                             errors: [error.message],
@@ -1417,7 +1465,9 @@
                 return result;
 
             } catch (error) {
-                result.errors.push(error.message);
+                const errorMsg = `CSV parsing error: ${error.message}`;
+                result.errors.push(errorMsg);
+                console.error(errorMsg);
                 return result;
             }
         },
@@ -1599,39 +1649,32 @@
                 validationResult.rows.forEach(row => {
                     if (row.isValid && row.data) {
                         try {
-                            const observation = {
-                                id: row.data['ID'] || this.generateObservationId(),
-                                timestamp: row.data['_parsedTimestamp'] ? row.data['_parsedTimestamp'].toISOString() : new Date().toISOString(),
-                                observerName: row.data['Observer Name'] || '',
-                                scientificName: row.data['Scientific Name'] || '',
-                                commonName: row.data['Common Name'] || '',
+                            const observation = this.normalizeObservation({
+                                id: row.data['ID'],
+                                timestamp: row.data['_parsedTimestamp'] || row.data['Timestamp'],
+                                observerName: row.data['Observer Name'],
+                                scientificName: row.data['Scientific Name'],
+                                commonName: row.data['Common Name'],
                                 location: {
                                     text: row.data['Location'] || '',
                                     coordinates: (row.data['Latitude'] && row.data['Longitude']) ? {
                                         lat: parseFloat(row.data['Latitude']),
                                         lng: parseFloat(row.data['Longitude'])
-                                    } : null,
-                                    accuracy: null
+                                    } : null
                                 },
-                                habitat: row.data['Habitat'] || '',
-                                observationType: row.data['Observation Type'] || 'direct',
-                                characteristics: row.data['Characteristics'] || '',
-                                equipment: row.data['Equipment'] ? row.data['Equipment'].split(';').map(e => e.trim()).filter(e => e) : [],
-                                references: row.data['References'] || '',
-                                notes: row.data['Notes'] || '',
-                                photo: null,
-                                metadata: {
-                                    deviceInfo: 'Imported from CSV',
-                                    appVersion: '1.0',
-                                    lastModified: new Date().toISOString(),
-                                    importDate: new Date().toISOString()
-                                }
-                            };
+                                habitat: row.data['Habitat'],
+                                observationType: row.data['Observation Type'],
+                                characteristics: row.data['Characteristics'],
+                                equipment: row.data['Equipment'],
+                                references: row.data['References'],
+                                notes: row.data['Notes'],
+                                source: 'import'
+                            });
 
                             importedObservations.push(observation);
                             successCount++;
                         } catch (error) {
-                            console.error('Error creating observation from row:', error);
+                            console.warn('Error creating observation from row:', error, row.data);
                             errorCount++;
                         }
                     } else {
@@ -1666,16 +1709,14 @@
                             if (observationMap.has(importedObs.id)) {
                                 // Update existing observation
                                 const existingObs = observationMap.get(importedObs.id);
-                                observationMap.set(importedObs.id, {
+                                observationMap.set(importedObs.id, this.normalizeObservation({
                                     ...existingObs,
                                     ...importedObs,
                                     metadata: {
                                         ...existingObs.metadata,
-                                        lastModified: new Date().toISOString(),
-                                        source: 'merged from CSV',
-                                        importDate: new Date().toISOString()
+                                        source: 'merged'
                                     }
-                                });
+                                }));
                                 updateCount++;
                             } else {
                                 // Add new observation
@@ -1822,6 +1863,11 @@
             }
             
             return null;
+        },
+
+        // Helper for batch operations
+        getObservationsByIds(ids) {
+            return this.observations.filter(obs => ids.has(obs.id));
         },
 
         // Get filtered observations for export
@@ -2079,9 +2125,15 @@
             
             // Clean up mini map
             if (this.miniMap) {
-                this.miniMap.remove();
+                try {
+                    this.miniMap.remove();
+                } catch (e) {
+                    console.warn('Error removing mini map:', e);
+                }
                 this.miniMap = null;
             }
+            document.getElementById('mini-map-container').innerHTML = '';
+            document.getElementById('mini-map-container').style.display = 'none';
         },
 
         // Download CSV template
@@ -2944,6 +2996,48 @@
             const totalObservations = observations.length;
             let processedObservations = 0;
 
+            // Improved PDF text wrapping with isolated column handling
+            const addWrappedText = (text, x, startY, maxWidth, lineHeight = 5, maxLines = null) => {
+                if (!text || text.trim() === '') return startY;
+                
+                const lines = doc.splitTextToSize(text, maxWidth);
+                const linesToShow = maxLines ? lines.slice(0, maxLines) : lines;
+                
+                // Check if we have enough space
+                const requiredSpace = linesToShow.length * lineHeight;
+                if (y + requiredSpace > pageHeight - margin) {
+                    doc.addPage();
+                    currentPage++;
+                    y = margin;
+                    
+                    doc.setFontSize(10);
+                    doc.setTextColor(100);
+                    doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
+                    y += 5;
+                    
+                    doc.setDrawColor(200);
+                    doc.line(margin, y, pageWidth - margin, y);
+                    y += 10;
+                    startY = y;
+                }
+                
+                linesToShow.forEach((line, index) => {
+                    doc.text(line, x, startY + (index * lineHeight));
+                });
+                
+                const finalY = startY + (linesToShow.length * lineHeight);
+                
+                // Add ellipsis if text was truncated
+                if (maxLines && lines.length > maxLines) {
+                    doc.setFontSize(8);
+                    doc.setTextColor(120);
+                    doc.text('... (continued)', x, finalY);
+                    return finalY + 4;
+                }
+                
+                return finalY;
+            };
+
             // Helper function to check if we need a new page
             const checkPageSpace = (requiredSpace) => {
                 if (y + requiredSpace > pageHeight - margin) {
@@ -2964,43 +3058,6 @@
                     return true;
                 }
                 return false;
-            };
-
-            // Helper function to add text with word wrap and return new y position
-            const addWrappedText = (text, x, startY, maxWidth, lineHeight = 6) => {
-                if (!text || text.trim() === '') return startY;
-                
-                const lines = doc.splitTextToSize(text, maxWidth);
-                
-                // Check if we have enough space
-                if (checkPageSpace(lines.length * lineHeight)) {
-                    startY = y;
-                }
-                
-                lines.forEach((line, index) => {
-                    // Check for each line if we need new page
-                    if (startY + (index * lineHeight) > pageHeight - margin) {
-                        doc.addPage();
-                        currentPage++;
-                        y = margin;
-                        startY = y;
-                        
-                        // Add page header
-                        doc.setFontSize(10);
-                        doc.setTextColor(100);
-                        doc.text(`EcoLens Field Log - Page ${currentPage}`, margin, y);
-                        y += 5;
-                        
-                        // Add page separator
-                        doc.setDrawColor(200);
-                        doc.line(margin, y, pageWidth - margin, y);
-                        y += 10;
-                        startY = y;
-                    }
-                    doc.text(line, x, startY + (index * lineHeight));
-                });
-                
-                return startY + (lines.length * lineHeight);
             };
 
             // Update progress
@@ -3163,24 +3220,8 @@
                             doc.text(keyText, col1X, col1Y);
                             
                             doc.setFont('helvetica', 'normal');
-                            const wrappedLines = doc.splitTextToSize(item.value, columnWidth - keyWidth);
-                            
-                            // Handle multi-line values
-                            if (wrappedLines.length === 1) {
-                                doc.text(item.value, col1X + keyWidth, col1Y);
-                                col1Y += 5;
-                            } else {
-                                // First line
-                                doc.text(wrappedLines[0], col1X + keyWidth, col1Y);
-                                col1Y += 5;
-                                
-                                // Subsequent lines (indented)
-                                for (let j = 1; j < wrappedLines.length; j++) {
-                                    doc.text(wrappedLines[j], col1X + keyWidth, col1Y);
-                                    col1Y += 5;
-                                }
-                            }
-                            col1Y += 1; // Extra space between items
+                            col1Y = addWrappedText(item.value, col1X + keyWidth, col1Y, columnWidth - keyWidth, 5, 8);
+                            col1Y += 2;
                         });
                         
                         // COLUMN 2: Location & Equipment
@@ -3224,28 +3265,12 @@
                             doc.text(keyText, col2X, col2Y);
                             
                             doc.setFont('helvetica', 'normal');
-                            const wrappedLines = doc.splitTextToSize(item.value, columnWidth - keyWidth);
-                            
-                            // Handle multi-line values
-                            if (wrappedLines.length === 1) {
-                                doc.text(item.value, col2X + keyWidth, col2Y);
-                                col2Y += 5;
-                            } else {
-                                // First line
-                                doc.text(wrappedLines[0], col2X + keyWidth, col2Y);
-                                col2Y += 5;
-                                
-                                // Subsequent lines (indented)
-                                for (let j = 1; j < wrappedLines.length; j++) {
-                                    doc.text(wrappedLines[j], col2X + keyWidth, col2Y);
-                                    col2Y += 5;
-                                }
-                            }
-                            col2Y += 1; // Extra space between items
+                            col2Y = addWrappedText(item.value, col2X + keyWidth, col2Y, columnWidth - keyWidth, 5, 8);
+                            col2Y += 2;
                         });
                         
                         // Set y to the bottom of the tallest column
-                        y = Math.max(col1Y, col2Y) + 10;
+                        y = Math.max(col1Y, col2Y) + 15;
                         
                         // Characteristics section
                         if (obs.characteristics) {
